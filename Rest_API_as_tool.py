@@ -1,7 +1,12 @@
 """
-MCP Tools Agent
+Multi-Agent MCP Tools System
 ───────────────────────────
-Interact with GitHub repositories using LlamaIndex ReAct agent with MCP tools.
+A multi-agent system for interacting with GitHub repositories using specialized agents:
+1. Repository Agent: Handles repository operations
+2. Issue Agent: Handles issue operations
+3. User Agent: Handles user operations
+4. Master Agent: Orchestrates the specialized agents
+
 ──────────────────────────────────────────────────────────────────
 Prereqs
 -------
@@ -16,10 +21,11 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import List, Optional
+import json
+from typing import List, Optional, Dict, Any, Tuple
 from dotenv import load_dotenv
 
-from llama_index.core.tools import FunctionTool
+from llama_index.core.tools import FunctionTool, ToolMetadata
 from llama_index.core.agent import ReActAgent
 from llama_index.llms.openrouter import OpenRouter
 
@@ -51,6 +57,13 @@ from mcp_tools.users import (
     list_user_repos
 )
 
+# Define agent types
+class AgentType:
+    REPO = "repository"
+    ISSUE = "issue"
+    USER = "user"
+    MASTER = "master"
+
 def load_environment_variables() -> tuple:
     """Load environment variables and prompt for missing ones."""
     load_dotenv()
@@ -78,21 +91,17 @@ def load_environment_variables() -> tuple:
     
     return github_token, github_username, openrouter_key
 
-def build_agent() -> Optional[ReActAgent]:
-    """Build a ReAct agent with MCP tools."""
+def create_llm(openrouter_key: str) -> OpenRouter:
+    """Create an OpenRouter LLM instance."""
+    return OpenRouter(
+        model="openai/gpt-4o-mini",  # You can change this to any model OpenRouter supports
+        api_key=openrouter_key,
+    )
+
+def build_repo_agent(llm: OpenRouter) -> Optional[ReActAgent]:
+    """Build a specialized agent for repository operations."""
     try:
-        # Load environment variables
-        github_token, github_username, openrouter_key = load_environment_variables()
-        
-        print(f"\nUsing GitHub account: {github_username}")
-        
-        # Create LLM
-        llm = OpenRouter(
-            model="openai/gpt-4o-mini",  # You can change this to any model OpenRouter supports
-            api_key=openrouter_key,
-        )
-        
-        # Collect all MCP tools
+        # Collect repository tools
         repo_tools = [
             create_repository_tool,
             create_or_update_file_tool,
@@ -102,16 +111,64 @@ def build_agent() -> Optional[ReActAgent]:
             list_branches_tool,
             search_repositories_tool,
         ]
+        
+        # Create ReAct agent
+        agent = ReActAgent.from_tools(
+            tools=repo_tools,
+            llm=llm,
+            verbose=True,
+            max_iterations=5,
+            system_prompt=(
+                "You are a specialized GitHub Repository Agent. "
+                "You handle repository-related operations like creating repositories, "
+                "managing files, creating branches, and forking repositories. "
+                "Focus only on repository operations and provide detailed responses."
+            )
+        )
+        
+        return agent
+    
+    except Exception as e:
+        print(f"Error building repository agent: {e}")
+        return None
 
+def build_issue_agent(llm: OpenRouter) -> Optional[ReActAgent]:
+    """Build a specialized agent for issue operations."""
+    try:
+        # Collect issue tools
         issue_tools = [
             close_issue.close_issue_tool,
             comment_issue.comment_issue_tool,
-            create_issue.create_issue_tool, 
+            create_issue.create_issue_tool,
             get_issue.get_issue_tool,
             list_issues.list_issues_tool,
             search_issues.search_issues_tool,
-        ]  # Add issue-related tools here if needed
+        ]
+        
+        # Create ReAct agent
+        agent = ReActAgent.from_tools(
+            tools=issue_tools,
+            llm=llm,
+            verbose=True,
+            max_iterations=5,
+            system_prompt=(
+                "You are a specialized GitHub Issue Agent. "
+                "You handle issue-related operations like creating issues, "
+                "commenting on issues, closing issues, and searching for issues. "
+                "Focus only on issue operations and provide detailed responses."
+            )
+        )
+        
+        return agent
+    
+    except Exception as e:
+        print(f"Error building issue agent: {e}")
+        return None
 
+def build_user_agent(llm: OpenRouter) -> Optional[ReActAgent]:
+    """Build a specialized agent for user operations."""
+    try:
+        # Collect user tools
         user_tools = [
             get_authenticated_user.get_authenticated_user_tool,
             get_user.get_user_tool,
@@ -120,33 +177,141 @@ def build_agent() -> Optional[ReActAgent]:
             list_user_repos.list_user_repos_tool,
         ]
         
-
-        tools = repo_tools + issue_tools + user_tools  # Combine all tools
-        # Print available tools
-        print("\nAvailable MCP tools:")
-        print(f"All tools will only access repositories owned by: {github_username}")
-        for i, tool in enumerate(tools):
-            print(f"{i+1}. {tool.metadata.name}: {tool.metadata.description}")
-        
         # Create ReAct agent
         agent = ReActAgent.from_tools(
-            tools=tools,  # Combine repo and issue tools
+            tools=user_tools,
             llm=llm,
-            verbose=True,  # Show tool calls in the console
-            max_iterations=10,
+            verbose=True,
+            max_iterations=5,
+            system_prompt=(
+                "You are a specialized GitHub User Agent. "
+                "You handle user-related operations like getting user information, "
+                "listing followers, listing following, and listing user repositories. "
+                "Focus only on user operations and provide detailed responses."
+            )
         )
         
         return agent
     
     except Exception as e:
-        print(f"Error building agent: {e}")
+        print(f"Error building user agent: {e}")
         return None
 
-def run_interactive_loop(agent: ReActAgent) -> None:
-    """Run an interactive loop for communicating with the agent."""
-    print("\n=== MCP Tools Agent ===")
+def create_agent_tool(agent: ReActAgent, agent_type: str) -> FunctionTool:
+    """Create a tool that represents a specialized agent."""
+    
+    # Use a lambda function to directly handle the input parameter
+    return FunctionTool(
+        fn=lambda **kwargs: str(agent.chat(kwargs.get('input', ''))),
+        metadata=ToolMetadata(
+            name=f"{agent_type}_agent",
+            description=f"Use the {agent_type} agent to handle {agent_type}-related operations."
+        )
+    )
+
+def build_master_agent(
+    repo_agent: ReActAgent,
+    issue_agent: ReActAgent,
+    user_agent: ReActAgent,
+    llm: OpenRouter,
+    github_username: str
+) -> Optional[ReActAgent]:
+    """Build a master agent that orchestrates the specialized agents."""
+    try:
+        # Create tools for each specialized agent
+        repo_agent_tool = create_agent_tool(repo_agent, AgentType.REPO)
+        issue_agent_tool = create_agent_tool(issue_agent, AgentType.ISSUE)
+        user_agent_tool = create_agent_tool(user_agent, AgentType.USER)
+        
+        # Collect all agent tools
+        agent_tools = [
+            repo_agent_tool,
+            issue_agent_tool,
+            user_agent_tool,
+        ]
+        
+        # Create ReAct agent
+        agent = ReActAgent.from_tools(
+            tools=agent_tools,
+            llm=llm,
+            verbose=True,
+            max_iterations=10,
+            system_prompt=(
+                f"You are a Master GitHub Agent that orchestrates specialized agents. "
+                f"You have access to the following specialized agents:\n"
+                f"1. Repository Agent: Handles repository operations\n"
+                f"2. Issue Agent: Handles issue operations\n"
+                f"3. User Agent: Handles user operations\n\n"
+                f"All operations will only access repositories owned by: {github_username}\n\n"
+                f"When given a task, analyze it and delegate to the appropriate specialized agent. "
+                f"For complex tasks that require multiple agents, break down the task and delegate each part. "
+                f"Ensure that you handle dependencies between tasks correctly."
+            )
+        )
+        
+        return agent
+    
+    except Exception as e:
+        print(f"Error building master agent: {e}")
+        return None
+
+def build_multi_agent_system() -> Optional[Tuple[ReActAgent, Dict[str, ReActAgent]]]:
+    """Build a multi-agent system with specialized agents and a master agent."""
+    try:
+        # Load environment variables
+        github_token, github_username, openrouter_key = load_environment_variables()
+        
+        print(f"\nUsing GitHub account: {github_username}")
+        
+        # Create LLM
+        llm = create_llm(openrouter_key)
+        
+        # Build specialized agents
+        print("\nBuilding specialized agents...")
+        repo_agent = build_repo_agent(llm)
+        issue_agent = build_issue_agent(llm)
+        user_agent = build_user_agent(llm)
+        
+        if not repo_agent or not issue_agent or not user_agent:
+            print("Failed to build one or more specialized agents.")
+            return None
+        
+        # Build master agent
+        print("\nBuilding master agent...")
+        master_agent = build_master_agent(repo_agent, issue_agent, user_agent, llm, github_username)
+        
+        if not master_agent:
+            print("Failed to build master agent.")
+            return None
+        
+        # Create a dictionary of all agents
+        agents = {
+            AgentType.REPO: repo_agent,
+            AgentType.ISSUE: issue_agent,
+            AgentType.USER: user_agent,
+            AgentType.MASTER: master_agent
+        }
+        
+        # Print available agents
+        print("\nAvailable specialized agents:")
+        print(f"All agents will only access repositories owned by: {github_username}")
+        
+        for agent_type in agents:
+            if agent_type != AgentType.MASTER:
+                print(f"- {agent_type.capitalize()} Agent")
+        
+        return master_agent, agents
+    
+    except Exception as e:
+        print(f"Error building multi-agent system: {e}")
+        return None
+
+def run_interactive_loop(master_agent: ReActAgent, agents: Dict[str, ReActAgent]) -> None:
+    """Run an interactive loop for communicating with the multi-agent system."""
+    print("\n=== Multi-Agent MCP Tools System ===")
     print("Type 'exit' to quit the program.")
     print("Type 'help' to see available commands.")
+    print("Type 'agents' to see available agents.")
     
     while True:
         try:
@@ -164,7 +329,17 @@ def run_interactive_loop(agent: ReActAgent) -> None:
                 print("  help - Show this help message")
                 print("  exit/quit - Exit the program")
                 print("  clear - Clear the screen")
-                print("  Any other input will be sent to the agent")
+                print("  agents - Show available agents")
+                print("  Any other input will be sent to the master agent")
+                continue
+            
+            # Check for agents command
+            if user_input.lower() == "agents":
+                print("\nAvailable agents:")
+                print("  1. Master Agent - Orchestrates the specialized agents")
+                print("  2. Repository Agent - Handles repository operations")
+                print("  3. Issue Agent - Handles issue operations")
+                print("  4. User Agent - Handles user operations")
                 continue
             
             # Check for clear command
@@ -176,12 +351,38 @@ def run_interactive_loop(agent: ReActAgent) -> None:
             if not user_input:
                 continue
             
-            # Send input to agent
-            print("\nAgent is thinking...")
-            response = agent.chat(user_input)
-            
-            # Display agent response
-            print(f"\nAgent: {response}")
+            # Check if user wants to use a specific agent
+            if user_input.lower().startswith("use "):
+                parts = user_input.split(" ", 2)
+                if len(parts) < 3:
+                    print("Invalid command. Format: use <agent_type> <query>")
+                    continue
+                
+                agent_type = parts[1].lower()
+                query = parts[2]
+                
+                if agent_type == "repo" or agent_type == "repository":
+                    agent = agents[AgentType.REPO]
+                elif agent_type == "issue":
+                    agent = agents[AgentType.ISSUE]
+                elif agent_type == "user":
+                    agent = agents[AgentType.USER]
+                elif agent_type == "master":
+                    agent = agents[AgentType.MASTER]
+                else:
+                    print(f"Unknown agent type: {agent_type}")
+                    continue
+                
+                print(f"\n{agent_type.capitalize()} Agent is thinking...")
+                response = agent.chat(query)
+                print(f"\n{agent_type.capitalize()} Agent: {response}")
+            else:
+                # Send input to master agent
+                print("\nMaster Agent is thinking...")
+                response = master_agent.chat(user_input)
+                
+                # Display agent response
+                print(f"\nMaster Agent: {response}")
             
         except KeyboardInterrupt:
             print("\nOperation interrupted by user. Type 'exit' to quit.")
@@ -191,15 +392,17 @@ def run_interactive_loop(agent: ReActAgent) -> None:
 def main():
     """Main function."""
     try:
-        # Build agent
-        agent = build_agent()
+        # Build multi-agent system
+        result = build_multi_agent_system()
         
-        if not agent:
-            print("Failed to build agent. Exiting...")
+        if not result:
+            print("Failed to build multi-agent system. Exiting...")
             sys.exit(1)
         
+        master_agent, agents = result
+        
         # Run interactive loop
-        run_interactive_loop(agent)
+        run_interactive_loop(master_agent, agents)
         
     except KeyboardInterrupt:
         print("\nProgram terminated by user.")
